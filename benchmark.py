@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from config import MODELS, RANDOM_SEED, RESULTS_DIR, SAMPLE_SIZE
+from config import MODELS, RANDOM_SEED, RESULTS_DIR, SAMPLE_SIZE, DIFFICULTY_MODE
 from dataset import NEJMDataset, load_and_sample_dataset
 from judge import JudgeClient, ModelScores
 from models import OpenRouterClient
@@ -14,11 +14,16 @@ from models import OpenRouterClient
 
 def generate_report(
     scores: dict[str, ModelScores],
+    challenges: list,
     run_id: str,
     timestamp: str,
     sample_size: int,
 ) -> str:
-    """Generate a markdown report of benchmark results."""
+    """Generate a markdown report of benchmark results with binary scoring."""
+    # Calculate difficulty stats from challenges
+    avg_brier = sum(c.brier_score for c in challenges) / len(challenges) if challenges else 0
+    avg_physician_acc = sum(c.physician_accuracy for c in challenges) / len(challenges) if challenges else 0
+
     lines = [
         "# NEJM Image Challenge Benchmark Results",
         "",
@@ -26,62 +31,51 @@ def generate_report(
         f"**Timestamp:** {timestamp}",
         f"**Sample Size:** {sample_size} challenges",
         f"**Random Seed:** {RANDOM_SEED}",
+        f"**Difficulty Mode:** {DIFFICULTY_MODE}",
+        "",
+        "### Difficulty Statistics",
+        f"- **Avg Brier Score:** {avg_brier:.3f} (lower = easier)",
+        f"- **Avg Physician Accuracy:** {avg_physician_acc:.1f}%",
         "",
         "---",
         "",
         "## Summary",
         "",
-        "| Model | Avg Score | Exact (10) | High (7-9) | Partial (4-6) | Low (1-3) | Wrong (0) |",
-        "|-------|-----------|------------|------------|---------------|-----------|-----------|",
+        "| Model | Accuracy | Correct | Incorrect | Invalid | Total |",
+        "|-------|----------|---------|-----------|---------|-------|",
     ]
 
-    # Sort models by average score (descending)
-    sorted_models = sorted(scores.items(), key=lambda x: x[1].average_score, reverse=True)
+    # Sort models by accuracy (descending)
+    sorted_models = sorted(scores.items(), key=lambda x: x[1].accuracy, reverse=True)
 
     for model_name, model_scores in sorted_models:
-        dist = model_scores.score_distribution
-        exact = dist.get(10, 0)
-        high = sum(dist.get(i, 0) for i in range(7, 10))
-        partial = sum(dist.get(i, 0) for i in range(4, 7))
-        low = sum(dist.get(i, 0) for i in range(1, 4))
-        wrong = dist.get(0, 0)
+        breakdown = model_scores.category_breakdown
+        correct = breakdown.get("Correct", 0)
+        incorrect = breakdown.get("Incorrect", 0)
+        invalid = breakdown.get("Invalid", 0)
+        total = model_scores.total_count
 
         lines.append(
-            f"| {model_name} | **{model_scores.average_score:.2f}** | {exact} | {high} | {partial} | {low} | {wrong} |"
+            f"| {model_name} | **{model_scores.accuracy:.1f}%** | {correct} | {incorrect} | {invalid} | {total} |"
         )
 
     lines.extend([
         "",
         "---",
         "",
-        "## Score Distribution by Model",
+        "## Model Details",
         "",
     ])
 
     for model_name, model_scores in sorted_models:
+        breakdown = model_scores.category_breakdown
         lines.append(f"### {model_name}")
         lines.append("")
-        lines.append(f"- **Average Score:** {model_scores.average_score:.2f}/10")
-        lines.append(f"- **Successful Evaluations:** {model_scores.success_count}")
-        lines.append(f"- **Failed Evaluations:** {model_scores.failure_count}")
-        lines.append("")
-
-        # Category breakdown
-        lines.append("**Category Breakdown:**")
-        for category, count in sorted(model_scores.category_breakdown.items(), key=lambda x: -x[1]):
-            lines.append(f"- {category}: {count}")
-        lines.append("")
-
-        # Score histogram
-        lines.append("**Score Distribution:**")
-        lines.append("```")
-        dist = model_scores.score_distribution
-        max_count = max(dist.values()) if dist.values() else 1
-        for score_val in range(10, -1, -1):
-            count = dist.get(score_val, 0)
-            bar = "█" * int(20 * count / max_count) if max_count > 0 else ""
-            lines.append(f"{score_val:2d} | {bar} {count}")
-        lines.append("```")
+        lines.append(f"- **Accuracy:** {model_scores.accuracy:.1f}% ({model_scores.correct_count}/{model_scores.total_count})")
+        lines.append(f"- **Correct:** {breakdown.get('Correct', 0)}")
+        lines.append(f"- **Incorrect:** {breakdown.get('Incorrect', 0)}")
+        lines.append(f"- **Invalid (no letter extracted):** {breakdown.get('Invalid', 0)}")
+        lines.append(f"- **Failed API calls:** {model_scores.failure_count}")
         lines.append("")
 
     lines.extend([
@@ -89,33 +83,44 @@ def generate_report(
         "",
         "## Per-Challenge Details",
         "",
-        "| Challenge | Correct Answer | " + " | ".join(m for m, _ in sorted_models) + " |",
-        "|-----------|----------------|" + "|".join("---" for _ in sorted_models) + "|",
+        "| Challenge | Correct | Physician % | " + " | ".join(m for m, _ in sorted_models) + " |",
+        "|-----------|---------|-------------|" + "|".join("---" for _ in sorted_models) + "|",
     ])
+
+    # Create lookup for challenge data
+    challenge_lookup = {c.id: c for c in challenges}
 
     # Get all challenge IDs from the first model's scores
     if sorted_models:
         first_model_scores = sorted_models[0][1].scores
         for i, score_obj in enumerate(first_model_scores):
             challenge_id = score_obj.challenge_id
-            correct_answer = score_obj.correct_answer[:40] + "..." if len(score_obj.correct_answer) > 40 else score_obj.correct_answer
+            challenge = challenge_lookup.get(challenge_id)
 
-            # Get scores for each model for this challenge
-            model_score_cells = []
+            correct_letter = score_obj.correct_answer_letter
+            physician_pct = challenge.physician_accuracy if challenge else 0
+
+            # Get results for each model for this challenge
+            model_result_cells = []
             for model_name, model_scores in sorted_models:
                 if i < len(model_scores.scores):
                     s = model_scores.scores[i]
-                    model_score_cells.append(f"{s.score:.0f}")
+                    if s.score == 1:
+                        model_result_cells.append(f"+{s.selected_letter}")
+                    elif s.selected_letter:
+                        model_result_cells.append(f"x{s.selected_letter}")
+                    else:
+                        model_result_cells.append("?")
                 else:
-                    model_score_cells.append("-")
+                    model_result_cells.append("-")
 
-            lines.append(f"| {challenge_id[:15]} | {correct_answer} | " + " | ".join(model_score_cells) + " |")
+            lines.append(f"| {challenge_id[:10]} | {correct_letter} | {physician_pct:.0f}% | " + " | ".join(model_result_cells) + " |")
 
     lines.extend([
         "",
         "---",
         "",
-        "*Generated by NEJM Image Challenge Benchmark*",
+        f"*Generated by NEJM Image Challenge Benchmark (Binary Scoring, {DIFFICULTY_MODE} mode)*",
     ])
 
     return "\n".join(lines)
@@ -130,13 +135,22 @@ def save_raw_results(
     output_path: Path,
 ) -> None:
     """Save raw benchmark results as JSON."""
+    # Calculate difficulty stats
+    avg_brier = sum(c.brier_score for c in challenges) / len(challenges) if challenges else 0
+    avg_physician_acc = sum(c.physician_accuracy for c in challenges) / len(challenges) if challenges else 0
+
     # Convert to serializable format
     challenges_data = [
         {
             "id": c.id,
             "image_url": c.image_url,
             "clinical_description": c.clinical_description,
-            "correct_answer": c.correct_answer,
+            "correct_answer_letter": c.correct_answer_letter,
+            "correct_answer_text": c.correct_answer,
+            "options": c.options,
+            "brier_score": c.brier_score,
+            "physician_accuracy": c.physician_accuracy,
+            "vote_distribution": c.vote_distribution,
         }
         for c in challenges
     ]
@@ -156,17 +170,19 @@ def save_raw_results(
     scores_data = {}
     for model_name, model_scores in scores.items():
         scores_data[model_name] = {
-            "average_score": model_scores.average_score,
-            "score_distribution": model_scores.score_distribution,
+            "accuracy": model_scores.accuracy,
+            "correct_count": model_scores.correct_count,
+            "total_count": model_scores.total_count,
             "category_breakdown": model_scores.category_breakdown,
             "individual_scores": [
                 {
                     "challenge_id": s.challenge_id,
                     "score": s.score,
                     "category": s.category,
-                    "reasoning": s.reasoning,
+                    "selected_letter": s.selected_letter,
+                    "correct_answer_letter": s.correct_answer_letter,
+                    "correct_answer_text": s.correct_answer_text,
                     "model_response": s.model_response,
-                    "correct_answer": s.correct_answer,
                     "success": s.success,
                     "error": s.error,
                 }
@@ -180,7 +196,12 @@ def save_raw_results(
         "config": {
             "sample_size": SAMPLE_SIZE,
             "random_seed": RANDOM_SEED,
+            "difficulty_mode": DIFFICULTY_MODE,
             "models": MODELS,
+        },
+        "difficulty_stats": {
+            "avg_brier_score": avg_brier,
+            "avg_physician_accuracy": avg_physician_acc,
         },
         "challenges": challenges_data,
         "responses": responses_data,
@@ -202,10 +223,11 @@ async def run_benchmark():
     print(f"Run ID: {run_id}")
     print(f"Timestamp: {timestamp}")
     print(f"Sample Size: {SAMPLE_SIZE}")
+    print(f"Difficulty Mode: {DIFFICULTY_MODE}")
     print(f"Models: {', '.join(MODELS.keys())}")
     print("=" * 60)
 
-    # Step 1: Load and sample dataset
+    # Step 1: Load and sample dataset with difficulty filtering
     print("\n[Step 1/4] Loading dataset and sampling challenges...")
     challenges = await load_and_sample_dataset(SAMPLE_SIZE, RANDOM_SEED)
     print(f"Prepared {len(challenges)} challenges with images")
@@ -215,8 +237,8 @@ async def run_benchmark():
     client = OpenRouterClient()
     model_responses = await client.query_all_models(MODELS, challenges)
 
-    # Step 3: Judge all responses
-    print("\n[Step 3/4] Judging responses...")
+    # Step 3: Score all responses (binary scoring)
+    print("\n[Step 3/4] Scoring responses...")
     judge = JudgeClient()
     scores = await judge.judge_all_responses(challenges, model_responses)
 
@@ -226,7 +248,7 @@ async def run_benchmark():
     results_dir.mkdir(exist_ok=True)
 
     # Generate and save markdown report
-    report = generate_report(scores, run_id, timestamp, len(challenges))
+    report = generate_report(scores, challenges, run_id, timestamp, len(challenges))
     report_path = results_dir / f"report_{run_id}.md"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
@@ -239,11 +261,11 @@ async def run_benchmark():
 
     # Print summary
     print("\n" + "=" * 60)
-    print("BENCHMARK COMPLETE - SUMMARY")
+    print("BENCHMARK COMPLETE - SUMMARY (Binary Scoring)")
     print("=" * 60)
-    sorted_models = sorted(scores.items(), key=lambda x: x[1].average_score, reverse=True)
+    sorted_models = sorted(scores.items(), key=lambda x: x[1].accuracy, reverse=True)
     for rank, (model_name, model_scores) in enumerate(sorted_models, 1):
-        print(f"{rank}. {model_name}: {model_scores.average_score:.2f}/10")
+        print(f"{rank}. {model_name}: {model_scores.accuracy:.1f}% ({model_scores.correct_count}/{model_scores.total_count})")
     print("=" * 60)
 
     return scores

@@ -1,38 +1,95 @@
-"""Judge model for evaluating diagnostic responses."""
+"""Binary scoring for multiple choice responses."""
 
-import asyncio
-import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-from config import (
-    JUDGE_MODEL,
-    JUDGE_PROMPT_TEMPLATE,
-    MAX_RETRIES,
-    OPENROUTER_API_KEY,
-    OPENROUTER_BASE_URL,
-    REQUEST_TIMEOUT,
-    RETRY_DELAY,
-)
 from dataset import Challenge
 from models import ModelResponse
 
 
+def extract_letter(response_text: str) -> str | None:
+    """Extract the selected letter (A-E) from a model response.
+
+    Handles various response formats:
+    - Just the letter: "B"
+    - Letter with period: "B."
+    - Letter at start: "B) Amelanotic melanoma"
+    - "The answer is B"
+    - "I select option B"
+    """
+    if not response_text:
+        return None
+
+    text = response_text.strip().upper()
+
+    # Check for just a single letter
+    if len(text) == 1 and text in "ABCDE":
+        return text
+
+    # Check for letter at the very start (possibly followed by punctuation)
+    if text and text[0] in "ABCDE":
+        # Make sure it's not part of a word like "AND"
+        if len(text) == 1 or text[1] in " .):\n\t":
+            return text[0]
+
+    # Look for common patterns
+    patterns = [
+        r"(?:the\s+)?answer\s+is\s+([A-E])",
+        r"(?:i\s+)?(?:select|choose|pick)\s+(?:option\s+)?([A-E])",
+        r"option\s+([A-E])",
+        r"^([A-E])\s*[\)\.:\-]",
+        r"\b([A-E])\b(?:\s*[\)\.:]|\s+is\s+(?:the\s+)?(?:correct|best|most\s+likely))",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+
+    # Last resort: find any standalone letter A-E
+    match = re.search(r"\b([A-E])\b", text)
+    if match:
+        return match.group(1).upper()
+
+    return None
+
+
+def score_response(response_text: str, correct_letter: str) -> tuple[int, str, str]:
+    """Score a model response using binary scoring.
+
+    Args:
+        response_text: The model's response
+        correct_letter: The correct answer letter (A-E)
+
+    Returns:
+        Tuple of (score, category, selected_letter)
+        - score: 1 if correct, 0 if incorrect
+        - category: "Correct" or "Incorrect" or "Invalid"
+        - selected_letter: The letter extracted from the response
+    """
+    selected = extract_letter(response_text)
+
+    if selected is None:
+        return 0, "Invalid", ""
+
+    if selected == correct_letter.upper():
+        return 1, "Correct", selected
+
+    return 0, "Incorrect", selected
+
+
 @dataclass
 class JudgeScore:
-    """Score from the judge model."""
+    """Score for a single challenge response."""
 
     challenge_id: str
     model_id: str
     model_response: str
-    correct_answer: str
-    score: float
-    category: str
-    reasoning: str
+    correct_answer_letter: str
+    correct_answer_text: str
+    selected_letter: str
+    score: int  # 0 or 1
+    category: str  # "Correct", "Incorrect", or "Invalid"
     success: bool
     error: str | None = None
 
@@ -45,27 +102,30 @@ class ModelScores:
     scores: list[JudgeScore] = field(default_factory=list)
 
     @property
-    def average_score(self) -> float:
-        valid_scores = [s.score for s in self.scores if s.success]
-        return sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
+    def accuracy(self) -> float:
+        """Percentage of correct answers (0-100)."""
+        valid_scores = [s for s in self.scores if s.success]
+        if not valid_scores:
+            return 0.0
+        return sum(s.score for s in valid_scores) / len(valid_scores) * 100
 
     @property
-    def score_distribution(self) -> dict[int, int]:
-        """Count of scores by integer value (0-10)."""
-        dist = {i: 0 for i in range(11)}
-        for s in self.scores:
-            if s.success:
-                dist[int(s.score)] += 1
-        return dist
+    def correct_count(self) -> int:
+        """Number of correct answers."""
+        return sum(s.score for s in self.scores if s.success)
+
+    @property
+    def total_count(self) -> int:
+        """Total number of evaluated responses."""
+        return sum(1 for s in self.scores if s.success)
 
     @property
     def category_breakdown(self) -> dict[str, int]:
         """Count of scores by category."""
-        breakdown: dict[str, int] = {}
+        breakdown: dict[str, int] = {"Correct": 0, "Incorrect": 0, "Invalid": 0}
         for s in self.scores:
-            if s.success:
-                cat = s.category
-                breakdown[cat] = breakdown.get(cat, 0) + 1
+            if s.success and s.category in breakdown:
+                breakdown[s.category] += 1
         return breakdown
 
     @property
@@ -76,137 +136,76 @@ class ModelScores:
     def failure_count(self) -> int:
         return sum(1 for s in self.scores if not s.success)
 
+    # Legacy property for backwards compatibility
+    @property
+    def average_score(self) -> float:
+        """Legacy: Returns accuracy as a 0-10 scale for backwards compatibility."""
+        return self.accuracy / 10
+
+    @property
+    def score_distribution(self) -> dict[int, int]:
+        """Binary distribution: count of 0s and 1s."""
+        dist = {0: 0, 1: 0}
+        for s in self.scores:
+            if s.success:
+                dist[s.score] = dist.get(s.score, 0) + 1
+        return dist
+
 
 class JudgeClient:
-    """Client for the judge model to evaluate responses."""
+    """Client for scoring multiple choice responses using binary scoring.
 
-    def __init__(self, api_key: str = OPENROUTER_API_KEY, judge_model: str = JUDGE_MODEL):
-        if not api_key:
-            raise ValueError("OPENROUTER_API_KEY not set. Check your .env file.")
-        self.api_key = api_key
-        self.judge_model = judge_model
-        self.base_url = OPENROUTER_BASE_URL
+    Note: This no longer uses an LLM judge. Scoring is done by simple
+    letter matching for the multiple choice format.
+    """
 
-    def _get_headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/nejm-benchmark",
-            "X-Title": "NEJM Image Challenge Benchmark - Judge",
-        }
+    def __init__(self, **kwargs):
+        """Initialize the judge client.
 
-    def _build_judge_prompt(self, correct_answer: str, model_response: str) -> str:
-        return JUDGE_PROMPT_TEMPLATE.format(
-            correct_answer=correct_answer, model_response=model_response
-        )
-
-    def _parse_judge_response(self, response_text: str) -> dict[str, Any]:
-        """Parse JSON from judge response, handling various formats."""
-        # Try to extract JSON from the response
-        # Sometimes models wrap JSON in markdown code blocks
-        json_match = re.search(r"\{[^{}]*\}", response_text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # Try parsing the whole response as JSON
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            pass
-
-        # Fallback: try to extract score from text
-        score_match = re.search(r"(?:score|Score)[:\s]*(\d+(?:\.\d+)?)", response_text)
-        if score_match:
-            return {
-                "score": float(score_match.group(1)),
-                "category": "Unknown",
-                "reasoning": response_text[:200],
-            }
-
-        raise ValueError(f"Could not parse judge response: {response_text[:200]}")
-
-    @retry(
-        stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_exponential(multiplier=RETRY_DELAY, min=1, max=10),
-    )
-    async def _make_request(self, prompt: str) -> str:
-        """Make an API request to the judge model."""
-        payload = {
-            "model": self.judge_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 300,
-            "temperature": 0.0,
-        }
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._get_headers(),
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
+        Args are accepted for backwards compatibility but ignored.
+        """
+        pass
 
     async def judge_response(
         self, challenge: Challenge, model_response: ModelResponse
     ) -> JudgeScore:
-        """Judge a single model response."""
+        """Score a single model response."""
         if not model_response.success:
             return JudgeScore(
                 challenge_id=challenge.id,
                 model_id=model_response.model_id,
                 model_response=model_response.response_text,
-                correct_answer=challenge.correct_answer,
-                score=0.0,
+                correct_answer_letter=challenge.correct_answer_letter,
+                correct_answer_text=challenge.correct_answer,
+                selected_letter="",
+                score=0,
                 category="Failed",
-                reasoning="Model failed to generate a response",
                 success=False,
                 error=model_response.error,
             )
 
-        try:
-            prompt = self._build_judge_prompt(
-                correct_answer=challenge.correct_answer,
-                model_response=model_response.response_text,
-            )
-            response_text = await self._make_request(prompt)
-            parsed = self._parse_judge_response(response_text)
+        score, category, selected = score_response(
+            model_response.response_text, challenge.correct_answer_letter
+        )
 
-            return JudgeScore(
-                challenge_id=challenge.id,
-                model_id=model_response.model_id,
-                model_response=model_response.response_text,
-                correct_answer=challenge.correct_answer,
-                score=float(parsed.get("score", 0)),
-                category=str(parsed.get("category", "Unknown")),
-                reasoning=str(parsed.get("reasoning", "")),
-                success=True,
-            )
-
-        except Exception as e:
-            return JudgeScore(
-                challenge_id=challenge.id,
-                model_id=model_response.model_id,
-                model_response=model_response.response_text,
-                correct_answer=challenge.correct_answer,
-                score=0.0,
-                category="Error",
-                reasoning="",
-                success=False,
-                error=str(e),
-            )
+        return JudgeScore(
+            challenge_id=challenge.id,
+            model_id=model_response.model_id,
+            model_response=model_response.response_text,
+            correct_answer_letter=challenge.correct_answer_letter,
+            correct_answer_text=challenge.correct_answer,
+            selected_letter=selected,
+            score=score,
+            category=category,
+            success=True,
+        )
 
     async def judge_all_responses(
         self,
         challenges: list[Challenge],
         model_responses: dict[str, list[ModelResponse]],
     ) -> dict[str, ModelScores]:
-        """Judge all responses for all models."""
+        """Score all responses for all models."""
         results: dict[str, ModelScores] = {}
 
         # Create a lookup for challenges by ID
@@ -216,7 +215,7 @@ class JudgeClient:
         completed = 0
 
         for model_name, responses in model_responses.items():
-            print(f"\nJudging {model_name} responses...")
+            print(f"\nScoring {model_name} responses...")
             model_scores = ModelScores(model_name=model_name)
 
             for response in responses:
@@ -228,11 +227,15 @@ class JudgeClient:
                 model_scores.scores.append(score)
                 completed += 1
 
-                status = f"Score: {score.score}" if score.success else f"FAILED: {score.error}"
-                print(f"  [{completed}/{total_judgments}] {response.challenge_id}: {status}")
+                if score.success:
+                    status_icon = "+" if score.score == 1 else "x"
+                    selected_info = f"Selected {score.selected_letter}" if score.selected_letter else "No letter"
+                    correct_info = f"Correct: {score.correct_answer_letter}"
+                    status = f"[{status_icon}] {selected_info}, {correct_info}"
+                else:
+                    status = f"FAILED: {score.error}"
 
-                # Small delay between requests
-                await asyncio.sleep(0.3)
+                print(f"  [{completed}/{total_judgments}] {response.challenge_id}: {status}")
 
             results[model_name] = model_scores
 

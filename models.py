@@ -51,9 +51,14 @@ class OpenRouterClient:
     def _build_vision_message(
         self, challenge: Challenge, image_base64: str
     ) -> list[dict[str, Any]]:
-        """Build the message payload with image and text."""
+        """Build the message payload with image and text including multiple choice options."""
         user_prompt = USER_PROMPT_TEMPLATE.format(
-            clinical_description=challenge.clinical_description
+            clinical_description=challenge.clinical_description,
+            option_A=challenge.options.get("A", "N/A"),
+            option_B=challenge.options.get("B", "N/A"),
+            option_C=challenge.options.get("C", "N/A"),
+            option_D=challenge.options.get("D", "N/A"),
+            option_E=challenge.options.get("E", "N/A"),
         )
 
         return [

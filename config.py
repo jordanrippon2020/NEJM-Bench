@@ -23,6 +23,19 @@ JUDGE_MODEL = "anthropic/claude-sonnet-4"
 SAMPLE_SIZE = 50
 RANDOM_SEED = 42  # For reproducibility
 
+# Difficulty settings
+# - "all": No filtering, use all cases (easy benchmark)
+# - "hard": Brier >= 0.087, physician accuracy ~30% (challenging benchmark)
+# - "expert": Brier >= 0.123, physician accuracy ~27% (very hard benchmark)
+DIFFICULTY_MODE = "hard"
+
+BRIER_THRESHOLDS = {
+    "easy": 0.040,      # Cases where physicians get ~74% correct
+    "medium": 0.087,    # Cases where physicians get ~50% correct
+    "hard": 0.087,      # >= this threshold for hard mode (~30% physician accuracy)
+    "expert": 0.123,    # >= this threshold for expert mode (~27% physician accuracy)
+}
+
 # Dataset URLs
 DATASET_URL = "https://raw.githubusercontent.com/cx0/nejm-image-challenge/main/image_challenge_dataset_20231223.json"
 
@@ -36,13 +49,21 @@ RETRY_DELAY = 1.0  # seconds
 REQUEST_TIMEOUT = 300.0  # seconds (5 min for extended thinking with max tokens)
 
 # Prompts
-SYSTEM_PROMPT = """You are an expert physician. Given a clinical image and patient history, provide your most likely diagnosis. Be specific and concise. Do not hedge or list multiple possibilities - give your single best answer."""
+SYSTEM_PROMPT = """You are an expert physician taking a diagnostic image challenge. Given a clinical image and patient history, select the most likely diagnosis from the options provided. Respond with only the letter (A, B, C, D, or E)."""
 
 USER_PROMPT_TEMPLATE = """Clinical Context: {clinical_description}
 
-What is the most likely diagnosis?"""
+Based on the clinical image, select the most likely diagnosis:
+A) {option_A}
+B) {option_B}
+C) {option_C}
+D) {option_D}
+E) {option_E}
 
-JUDGE_PROMPT_TEMPLATE = """You are an expert medical educator evaluating AI diagnostic responses.
+Respond with only the letter (A, B, C, D, or E)."""
+
+# Legacy judge prompt - kept for reference but no longer used with binary scoring
+JUDGE_PROMPT_TEMPLATE_LEGACY = """You are an expert medical educator evaluating AI diagnostic responses.
 
 Correct Diagnosis: {correct_answer}
 Model's Response: {model_response}
@@ -60,3 +81,6 @@ Score this response on a 0-10 scale based on diagnostic accuracy:
 
 Respond with JSON only, no other text:
 {{"score": <0-10>, "category": "<category name>", "reasoning": "<brief explanation>"}}"""
+
+# New binary scoring - no judge needed, just letter matching
+JUDGE_PROMPT_TEMPLATE = None  # Binary scoring doesn't need an LLM judge

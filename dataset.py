@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from config import CACHE_DIR, DATASET_URL, RANDOM_SEED, SAMPLE_SIZE
+from config import CACHE_DIR, DATASET_URL, RANDOM_SEED, SAMPLE_SIZE, DIFFICULTY_MODE, BRIER_THRESHOLDS
 
 # NEJM image server base URL
 NEJM_IMAGE_BASE = "https://csvc.nejm.org/ContentServer/images?id=IC"
@@ -68,14 +68,55 @@ class Challenge:
         # Get the actual text of the correct answer
         self.correct_answer = self.options.get(self.correct_answer_letter, "")
 
-        # Vote distribution
+        # Vote distribution - parse from "option_X_votes" fields (e.g., "12%")
         self.vote_distribution = {}
         for letter in ["A", "B", "C", "D", "E"]:
-            vote_key = f"vote_{letter}"
+            vote_key = f"option_{letter}_votes"
             if vote_key in data:
-                self.vote_distribution[letter] = data[vote_key]
+                vote_str = data[vote_key]
+                # Parse "12%" to 12.0
+                if isinstance(vote_str, str) and vote_str.endswith("%"):
+                    self.vote_distribution[letter] = float(vote_str.rstrip("%"))
+                elif isinstance(vote_str, (int, float)):
+                    self.vote_distribution[letter] = float(vote_str)
+
+        # Use pre-calculated Brier score if available in dataset
+        self._brier_score_cached = data.get("brier_score")
 
         self._image_base64: str | None = None
+
+    @property
+    def brier_score(self) -> float:
+        """Get Brier score (lower = easier case).
+
+        Uses pre-calculated value from dataset if available, otherwise
+        calculates from vote distribution.
+
+        Brier score measures the accuracy of probabilistic predictions.
+        For each option, we calculate (predicted_probability - actual_outcome)^2
+        where actual_outcome is 1 for the correct answer and 0 for others.
+        """
+        # Use pre-calculated value if available
+        if self._brier_score_cached is not None:
+            return float(self._brier_score_cached)
+
+        # Calculate from vote distribution
+        if not self.vote_distribution or not self.correct_answer_letter:
+            return 0.5  # Default to medium difficulty if data missing
+
+        brier = 0.0
+        for letter in ["A", "B", "C", "D", "E"]:
+            vote_pct = self.vote_distribution.get(letter, 0)
+            actual = 1.0 if letter == self.correct_answer_letter else 0.0
+            brier += (vote_pct / 100.0 - actual) ** 2
+        return brier
+
+    @property
+    def physician_accuracy(self) -> float:
+        """Return the percentage of physicians who selected the correct answer."""
+        if not self.vote_distribution or not self.correct_answer_letter:
+            return 0.0
+        return self.vote_distribution.get(self.correct_answer_letter, 0)
 
     def __repr__(self) -> str:
         answer_preview = self.correct_answer[:30] if self.correct_answer else "N/A"
@@ -116,14 +157,49 @@ class NEJMDataset:
 
         print(f"Loaded {len(self.challenges)} valid challenges (out of {len(all_challenges)} total)")
 
-    def sample(self, n: int = SAMPLE_SIZE, seed: int = RANDOM_SEED) -> list[Challenge]:
-        """Randomly sample n challenges from the dataset."""
+    def sample(
+        self, n: int = SAMPLE_SIZE, seed: int = RANDOM_SEED, difficulty: str = DIFFICULTY_MODE
+    ) -> list[Challenge]:
+        """Randomly sample n challenges from the dataset, filtered by difficulty.
+
+        Args:
+            n: Number of challenges to sample
+            seed: Random seed for reproducibility
+            difficulty: Difficulty mode - "all", "hard", or "expert"
+                - "all": No filtering, use all cases
+                - "hard": Brier >= 0.087 (physician accuracy ~30%)
+                - "expert": Brier >= 0.123 (physician accuracy ~27%)
+        """
         if not self.challenges:
             raise ValueError("Dataset not loaded. Call load() first.")
 
+        # Filter by difficulty
+        candidates = self.challenges
+        if difficulty == "hard":
+            threshold = BRIER_THRESHOLDS.get("hard", 0.087)
+            candidates = [c for c in self.challenges if c.brier_score >= threshold]
+            print(f"Filtered to {len(candidates)} hard cases (Brier >= {threshold})")
+        elif difficulty == "expert":
+            threshold = BRIER_THRESHOLDS.get("expert", 0.123)
+            candidates = [c for c in self.challenges if c.brier_score >= threshold]
+            print(f"Filtered to {len(candidates)} expert cases (Brier >= {threshold})")
+        else:
+            print(f"Using all {len(candidates)} cases (no difficulty filter)")
+
+        if len(candidates) < n:
+            print(f"Warning: Only {len(candidates)} cases available, requested {n}")
+            n = len(candidates)
+
         random.seed(seed)
-        sampled = random.sample(self.challenges, min(n, len(self.challenges)))
+        sampled = random.sample(candidates, min(n, len(candidates)))
+
+        # Print difficulty stats for sampled cases
+        avg_brier = sum(c.brier_score for c in sampled) / len(sampled) if sampled else 0
+        avg_physician_acc = sum(c.physician_accuracy for c in sampled) / len(sampled) if sampled else 0
         print(f"Sampled {len(sampled)} challenges (seed={seed})")
+        print(f"  Avg Brier score: {avg_brier:.3f}")
+        print(f"  Avg physician accuracy: {avg_physician_acc:.1f}%")
+
         return sampled
 
     async def download_image(self, challenge: Challenge) -> str:
@@ -182,11 +258,17 @@ class NEJMDataset:
 
 
 async def load_and_sample_dataset(
-    n: int = SAMPLE_SIZE, seed: int = RANDOM_SEED
+    n: int = SAMPLE_SIZE, seed: int = RANDOM_SEED, difficulty: str = DIFFICULTY_MODE
 ) -> list[Challenge]:
-    """Convenience function to load dataset and return sampled challenges with images."""
+    """Convenience function to load dataset and return sampled challenges with images.
+
+    Args:
+        n: Number of challenges to sample
+        seed: Random seed for reproducibility
+        difficulty: Difficulty mode - "all", "hard", or "expert"
+    """
     dataset = NEJMDataset()
     await dataset.load()
-    sampled = dataset.sample(n, seed)
+    sampled = dataset.sample(n, seed, difficulty)
     await dataset.prepare_challenges(sampled)
     return sampled
